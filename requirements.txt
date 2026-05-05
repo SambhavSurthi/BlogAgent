@@ -1,0 +1,14 @@
+langchain
+langgraph
+
+langsmith
+
+langchain-openai
+langchain_community
+langchain_classic
+langchain_core
+
+ipykernel
+dotenv
+
+pydantic

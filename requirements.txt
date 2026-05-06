@@ -2,6 +2,7 @@ langchain
 langgraph
 
 langsmith
+pandas
 
 langchain-openai
 langchain_community

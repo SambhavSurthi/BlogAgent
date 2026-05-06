@@ -12,3 +12,8 @@ ipykernel
 dotenv
 
 pydantic
+
+streamlit
+
+langgraph-checkpoint-sqlite
+google-genai

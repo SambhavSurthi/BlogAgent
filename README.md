@@ -91,8 +91,8 @@ Final Markdown (self-contained, images as data URIs)
 
 ```powershell
 # Clone the repo
-git clone https://github.com/your-username/blog-agent.git
-cd blog-agent
+git clone https://github.com/SambhavSurthi/BlogAgent.git
+cd BlogAgent
 
 # Create and activate virtual environment
 python -m venv .venv

@@ -16,4 +16,5 @@ pydantic
 streamlit
 
 langgraph-checkpoint-sqlite
-google-genai
+huggingface_hub
+pillow

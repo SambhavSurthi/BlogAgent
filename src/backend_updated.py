@@ -18,6 +18,10 @@ from __future__ import annotations
 import operator
 import os
 import re
+import io
+import json
+import urllib.request
+import urllib.error
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -625,53 +629,88 @@ def decide_images(state: State) -> dict:
         "image_specs": [img.model_dump() for img in image_plan.images],
     }
 
-
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    try:
-        import importlib
-
-        genai = importlib.import_module("google.genai")
-        types = importlib.import_module("google.genai.types")
-    except Exception as e:
-        raise RuntimeError(
-            "Gemini SDK import failed. Install/upgrade with: pip install -U google-genai"
-        ) from e
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
+def _hf_generate_image_bytes(
+    prompt: str,
+    size: str = "1024x1024",
+    quality: str = "medium",
+) -> bytes:
+    # Try a small set of widely-used text→image models via the HF Inference API.
+    api_key = os.environ.get("HUGGINGFACE_API_KEY") or os.environ.get("HF_TOKEN")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+        raise RuntimeError("HUGGINGFACE_API_KEY (or HF_TOKEN) is not set.")
 
-    client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
+    size_map = {
+        "1024x1024": (1024, 1024),
+        "1024x1536": (1024, 1536),
+        "1536x1024": (1536, 1024),
+    }
+    width, height = size_map.get(size, (1024, 1024))
+
+    size_hint = f"{width}x{height}"
+    quality_hint = {"low": "fast draft", "medium": "high clarity", "high": "ultra-detailed"}.get(quality, "high clarity")
+
+    effective_prompt = (
+        f"{prompt}\nStyle: technical diagram, clear labels, white background. {quality_hint}."
     )
 
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
+    # Candidate models (try until one works).
+    candidate_models = [
+        "runwayml/stable-diffusion-v1-5",
+        "stabilityai/stable-diffusion-2",
+        "CompVis/stable-diffusion-v1-4",
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "image/png",
+    }
+
+    last_err = None
+    for model_id in candidate_models:
+        payload = {
+            "inputs": effective_prompt,
+            "parameters": {"width": width, "height": height, "wait_for_model": True},
+        }
+
+        req = urllib.request.Request(
+            url=f"https://api-inference.huggingface.co/models/{model_id}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+
         try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                data = resp.read()
+                if content_type.startswith("image/"):
+                    return data
+                # Some models return JSON error
+                try:
+                    body = json.loads(data.decode("utf-8", errors="replace"))
+                    if isinstance(body, dict) and body.get("error"):
+                        last_err = f"Model {model_id} error: {body.get('error')[:400]}"
+                        continue
+                except Exception:
+                    last_err = f"Model {model_id} returned unexpected content-type: {content_type}"
+                    continue
 
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = he.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            last_err = f"HTTP {he.code} from model {model_id}: {err_body[:400]}"
+            continue
+        except Exception as e:
+            last_err = f"Request error for model {model_id}: {e}"
+            continue
 
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    # If we reach here no model produced an image
+    raise RuntimeError(
+        "All Hugging Face model attempts failed. " + (last_err or "no further details")
+    )
 
 
 def _safe_slug(title: str) -> str:
@@ -703,7 +742,11 @@ def generate_and_place_images(state: State) -> dict:
 
         if not out_path.exists():
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _hf_generate_image_bytes(
+                    prompt=spec["prompt"],
+                    size=spec.get("size", "1024x1024"),
+                    quality=spec.get("quality", "medium"),
+                )
                 out_path.write_bytes(img_bytes)
             except Exception as e:
                 prompt_block = (

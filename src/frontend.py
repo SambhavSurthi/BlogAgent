@@ -431,7 +431,8 @@ hr { border-color: var(--border) !important; margin: 1rem 0 !important; }
     color: var(--muted);
 }
 
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+header { visibility: visible; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -462,7 +463,7 @@ def _init_state():
         "hitl_plan": None,
 
         "openai_key": "",
-        "gemini_key": "",
+        "huggingface_key": "",
         "tavily_key": "",
         
         # active thread_id for the current session
@@ -473,6 +474,31 @@ def _init_state():
             st.session_state[k] = v
 
 _init_state()
+
+# Persist sessions to disk so chat history survives page refresh.
+SESSIONS_FILE = Path("sessions.json")
+
+def _persist_sessions_to_disk():
+    try:
+        SESSIONS_FILE.write_text(json.dumps(st.session_state.sessions, default=str), encoding="utf-8")
+    except Exception:
+        # Non-fatal — don't block UI
+        pass
+
+def _load_sessions_from_disk():
+    if not SESSIONS_FILE.exists():
+        return
+    try:
+        data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            # merge existing in-memory sessions (do not overwrite current running state)
+            merged = {**data, **st.session_state.get("sessions", {})}
+            st.session_state.sessions = merged
+    except Exception:
+        pass
+
+# Load persisted sessions (if any)
+_load_sessions_from_disk()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -504,7 +530,9 @@ def _create_session(topic: str) -> str:
         "logs": [],
         "status": "running",
     }
+    _persist_sessions_to_disk()
     return sid
+
 
 def _save_session_result(sid: str):
     if sid and sid in st.session_state.sessions:
@@ -516,6 +544,8 @@ def _save_session_result(sid: str):
             "logs": list(st.session_state.node_log),
             "status": st.session_state.run_status,
         })
+        # persist sessions to disk so they survive refresh
+        _persist_sessions_to_disk()
 
 def _load_session(sid: str):
     s = st.session_state.sessions.get(sid, {})
@@ -584,7 +614,7 @@ NODE_DESCRIPTIONS = {
     "critic_node":       "Scoring the draft on 5 dimensions: depth, citations, flow, SEO, tone.",
     "rewrite_prep":      "Critic found issues — resetting sections for a targeted rewrite pass.",
     "decide_images":     "Deciding where diagrams would improve understanding; writing prompts.",
-    "generate_and_place_images": "Generating images via Gemini and embedding them into markdown.",
+    "generate_and_place_images": "Generating images via Hugging Face and embedding them into markdown.",
     "reducer":           "Running reducer subgraph (merge → critic → images).",
 }
 
@@ -599,7 +629,7 @@ PIPELINE_ORDER = [
 # Background runner thread
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, gemini_key: str, tavily_key: str):
+def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, huggingface_key: str, tavily_key: str):
     """
     Runs the LangGraph app in a background thread, posting events to queue q.
 
@@ -621,7 +651,8 @@ def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, gemini_key
       ("done",)
     """
     os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["GOOGLE_API_KEY"] = gemini_key
+    os.environ["HUGGINGFACE_API_KEY"] = huggingface_key
+    os.environ["HF_TOKEN"] = huggingface_key
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
@@ -722,12 +753,13 @@ def _run_agent_hitl_resume(
     q: Queue,
     resume_payload: dict,
     openai_key: str,
-    gemini_key: str,
+    huggingface_key: str,
     tavily_key: str,
 ):
     """Resume the graph after HITL approval/edit."""
     os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["GOOGLE_API_KEY"] = gemini_key
+    os.environ["HUGGINGFACE_API_KEY"] = huggingface_key
+    os.environ["HF_TOKEN"] = huggingface_key
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
@@ -905,12 +937,12 @@ with st.sidebar:
             placeholder="sk-...",
             key="oai_input",
         )
-        gem = st.text_input(
-            "Google Gemini API Key",
+        hf = st.text_input(
+            "Hugging Face API Key",
             type="password",
-            value=st.session_state.gemini_key,
-            placeholder="AIza...",
-            key="gem_input",
+            value=st.session_state.huggingface_key,
+            placeholder="hf_...",
+            key="hf_input",
         )
         tav = st.text_input(
             "Tavily API Key (optional — for web research)",
@@ -921,7 +953,7 @@ with st.sidebar:
         )
         if st.button("Save Keys", key="save_keys"):
             st.session_state.openai_key = oai
-            st.session_state.gemini_key = gem
+            st.session_state.huggingface_key = hf
             st.session_state.tavily_key = tav
             st.success("Keys saved.")
 
@@ -996,6 +1028,7 @@ with st.sidebar:
         with col_b:
             if st.button("✕", key=f"del_{sid}", help="Delete session"):
                 del st.session_state.sessions[sid]
+                _persist_sessions_to_disk()
                 if st.session_state.active_session == sid:
                     st.session_state.active_session = None
                     st.session_state.run_status = "idle"
@@ -1064,16 +1097,16 @@ if status == "idle":
             st.error("Please enter a topic.")
         elif not st.session_state.openai_key and not st.session_state.get("oai_input"):
             st.error("OpenAI API key required — add it in the sidebar.")
-        elif not st.session_state.gemini_key and not st.session_state.get("gem_input"):
-            st.error("Gemini API key required for image generation — add it in the sidebar.")
+        elif not st.session_state.huggingface_key and not st.session_state.get("hf_input"):
+            st.error("Hugging Face API key required for image generation — add it in the sidebar.")
         else:
             oai_key = st.session_state.get("oai_input") or st.session_state.openai_key
-            gem_key = st.session_state.get("gem_input") or st.session_state.gemini_key
+            hf_key = st.session_state.get("hf_input") or st.session_state.huggingface_key
             tav_key = st.session_state.get("tav_input") or st.session_state.tavily_key
 
             # Persist keys
             st.session_state.openai_key = oai_key
-            st.session_state.gemini_key = gem_key
+            st.session_state.huggingface_key = hf_key
             st.session_state.tavily_key = tav_key
 
             sid = _create_session(topic.strip())
@@ -1101,7 +1134,7 @@ if status == "idle":
 
             t = threading.Thread(
                 target=_run_agent,
-                args=(topic.strip(), thread_id, q, oai_key, gem_key, tav_key),
+                args=(topic.strip(), thread_id, q, oai_key, hf_key, tav_key),
                 daemon=True,
             )
             t.start()
@@ -1232,7 +1265,7 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                     args=(
                         thread_id, q, {"approved": True},
                         st.session_state.openai_key,
-                        st.session_state.gemini_key,
+                        st.session_state.huggingface_key,
                         st.session_state.tavily_key,
                     ),
                     daemon=True,
@@ -1253,7 +1286,7 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                     args=(
                         thread_id, q, {"approved": False, "abort": True},
                         st.session_state.openai_key,
-                        st.session_state.gemini_key,
+                        st.session_state.huggingface_key,
                         st.session_state.tavily_key,
                     ),
                     daemon=True,
@@ -1284,7 +1317,7 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                                 thread_id, q,
                                 {"approved": False, "edited_plan": edited},
                                 st.session_state.openai_key,
-                                st.session_state.gemini_key,
+                                st.session_state.huggingface_key,
                                 st.session_state.tavily_key,
                             ),
                             daemon=True,

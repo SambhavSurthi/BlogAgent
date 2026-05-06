@@ -463,7 +463,6 @@ def _init_state():
         "hitl_plan": None,
 
         "openai_key": "",
-        "huggingface_key": "",
         "tavily_key": "",
         
         # active thread_id for the current session
@@ -570,6 +569,42 @@ def _download_button(label: str, data: str, filename: str, mime: str = "text/mar
     )
 
 
+def _markdown_mime_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".gif":
+        return "image/gif"
+    return "image/png"
+
+
+def _inline_markdown_images(md: str) -> str:
+    images_dir = Path("images")
+
+    def replace_image(match):
+        alt_text = match.group(1)
+        raw_path = match.group(2).strip()
+        clean_path = raw_path.split("?", 1)[0].split("#", 1)[0]
+        img_path = Path(clean_path)
+
+        if not img_path.is_absolute():
+            img_path = images_dir / img_path.name
+
+        if not img_path.exists():
+            return match.group(0)
+
+        try:
+            encoded = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+            mime_type = _markdown_mime_type(img_path)
+            return f"![{alt_text}](data:{mime_type};base64,{encoded})"
+        except Exception:
+            return match.group(0)
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, md)
+
+
 def _plan_from_snapshot(app: Any, config: dict) -> dict:
     """Best-effort extraction of plan dict from current checkpoint state."""
     try:
@@ -614,7 +649,7 @@ NODE_DESCRIPTIONS = {
     "critic_node":       "Scoring the draft on 5 dimensions: depth, citations, flow, SEO, tone.",
     "rewrite_prep":      "Critic found issues — resetting sections for a targeted rewrite pass.",
     "decide_images":     "Deciding where diagrams would improve understanding; writing prompts.",
-    "generate_and_place_images": "Generating images via Hugging Face and embedding them into markdown.",
+    "generate_and_place_images": "Generating images with OpenAI and embedding them into markdown.",
     "reducer":           "Running reducer subgraph (merge → critic → images).",
 }
 
@@ -629,7 +664,7 @@ PIPELINE_ORDER = [
 # Background runner thread
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, huggingface_key: str, tavily_key: str):
+def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, tavily_key: str):
     """
     Runs the LangGraph app in a background thread, posting events to queue q.
 
@@ -651,8 +686,6 @@ def _run_agent(topic: str, thread_id: str, q: Queue, openai_key: str, huggingfac
       ("done",)
     """
     os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["HUGGINGFACE_API_KEY"] = huggingface_key
-    os.environ["HF_TOKEN"] = huggingface_key
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
@@ -753,13 +786,10 @@ def _run_agent_hitl_resume(
     q: Queue,
     resume_payload: dict,
     openai_key: str,
-    huggingface_key: str,
     tavily_key: str,
 ):
     """Resume the graph after HITL approval/edit."""
     os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["HUGGINGFACE_API_KEY"] = huggingface_key
-    os.environ["HF_TOKEN"] = huggingface_key
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
@@ -937,13 +967,6 @@ with st.sidebar:
             placeholder="sk-...",
             key="oai_input",
         )
-        hf = st.text_input(
-            "Hugging Face API Key",
-            type="password",
-            value=st.session_state.huggingface_key,
-            placeholder="hf_...",
-            key="hf_input",
-        )
         tav = st.text_input(
             "Tavily API Key (optional — for web research)",
             type="password",
@@ -953,7 +976,6 @@ with st.sidebar:
         )
         if st.button("Save Keys", key="save_keys"):
             st.session_state.openai_key = oai
-            st.session_state.huggingface_key = hf
             st.session_state.tavily_key = tav
             st.success("Keys saved.")
 
@@ -1097,16 +1119,12 @@ if status == "idle":
             st.error("Please enter a topic.")
         elif not st.session_state.openai_key and not st.session_state.get("oai_input"):
             st.error("OpenAI API key required — add it in the sidebar.")
-        elif not st.session_state.huggingface_key and not st.session_state.get("hf_input"):
-            st.error("Hugging Face API key required for image generation — add it in the sidebar.")
         else:
             oai_key = st.session_state.get("oai_input") or st.session_state.openai_key
-            hf_key = st.session_state.get("hf_input") or st.session_state.huggingface_key
             tav_key = st.session_state.get("tav_input") or st.session_state.tavily_key
 
             # Persist keys
             st.session_state.openai_key = oai_key
-            st.session_state.huggingface_key = hf_key
             st.session_state.tavily_key = tav_key
 
             sid = _create_session(topic.strip())
@@ -1134,7 +1152,7 @@ if status == "idle":
 
             t = threading.Thread(
                 target=_run_agent,
-                args=(topic.strip(), thread_id, q, oai_key, hf_key, tav_key),
+                args=(topic.strip(), thread_id, q, oai_key, tav_key),
                 daemon=True,
             )
             t.start()
@@ -1265,7 +1283,6 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                     args=(
                         thread_id, q, {"approved": True},
                         st.session_state.openai_key,
-                        st.session_state.huggingface_key,
                         st.session_state.tavily_key,
                     ),
                     daemon=True,
@@ -1286,7 +1303,6 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                     args=(
                         thread_id, q, {"approved": False, "abort": True},
                         st.session_state.openai_key,
-                        st.session_state.huggingface_key,
                         st.session_state.tavily_key,
                     ),
                     daemon=True,
@@ -1317,7 +1333,6 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
                                 thread_id, q,
                                 {"approved": False, "edited_plan": edited},
                                 st.session_state.openai_key,
-                                st.session_state.huggingface_key,
                                 st.session_state.tavily_key,
                             ),
                             daemon=True,
@@ -1355,11 +1370,12 @@ elif status in ("running", "awaiting_hitl", "done", "error"):
     # ── TAB: BLOG ────────────────────────────────────────────────────────────
     with tab_blog:
         if st.session_state.final_md:
+            rendered_md = _inline_markdown_images(st.session_state.final_md)
             _col_dl, _col_sp = st.columns([1, 4])
             with _col_dl:
-                _download_button("⬇ Download .md", st.session_state.final_md, "blog.md")
+                _download_button("⬇ Download .md", rendered_md, "blog.md")
             st.markdown('<div class="blog-body">', unsafe_allow_html=True)
-            st.markdown(st.session_state.final_md)
+            st.markdown(rendered_md)
             st.markdown("</div>", unsafe_allow_html=True)
         elif status in ("running", "awaiting_hitl"):
             st.markdown(

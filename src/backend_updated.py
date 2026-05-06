@@ -18,15 +18,15 @@ from __future__ import annotations
 import operator
 import os
 import re
-import io
+import base64
 import json
 import urllib.request
-import urllib.error
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 
 from pydantic import BaseModel, Field
+from openai import OpenAI
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send, interrupt
@@ -91,7 +91,7 @@ class ImageSpec(BaseModel):
     caption: str
     prompt: str = Field(..., description="Prompt to send to the image model.")
     size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
-    quality: Literal["low", "medium", "high"] = "medium"
+    quality: Literal["low", "medium", "high"] = "low"
 
 
 class GlobalImagePlan(BaseModel):
@@ -629,88 +629,38 @@ def decide_images(state: State) -> dict:
         "image_specs": [img.model_dump() for img in image_plan.images],
     }
 
-def _hf_generate_image_bytes(
+def _openai_generate_image_bytes(
     prompt: str,
     size: str = "1024x1024",
-    quality: str = "medium",
+    quality: str = "low",
 ) -> bytes:
-    # Try a small set of widely-used text→image models via the HF Inference API.
-    api_key = os.environ.get("HUGGINGFACE_API_KEY") or os.environ.get("HF_TOKEN")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("HUGGINGFACE_API_KEY (or HF_TOKEN) is not set.")
+        raise RuntimeError("OPENAI_API_KEY is not set.")
 
-    size_map = {
-        "1024x1024": (1024, 1024),
-        "1024x1536": (1024, 1536),
-        "1536x1024": (1536, 1024),
-    }
-    width, height = size_map.get(size, (1024, 1024))
-
-    size_hint = f"{width}x{height}"
-    quality_hint = {"low": "fast draft", "medium": "high clarity", "high": "ultra-detailed"}.get(quality, "high clarity")
-
+    client = OpenAI(api_key=api_key)
     effective_prompt = (
-        f"{prompt}\nStyle: technical diagram, clear labels, white background. {quality_hint}."
+        f"{prompt}\nStyle: technical diagram, clear labels, white background. "
+        f"Low-resolution draft, minimal detail, clean layout."
     )
 
-    # Candidate models (try until one works).
-    candidate_models = [
-        "runwayml/stable-diffusion-v1-5",
-        "stabilityai/stable-diffusion-2",
-        "CompVis/stable-diffusion-v1-4",
-    ]
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "image/png",
-    }
-
-    last_err = None
-    for model_id in candidate_models:
-        payload = {
-            "inputs": effective_prompt,
-            "parameters": {"width": width, "height": height, "wait_for_model": True},
-        }
-
-        req = urllib.request.Request(
-            url=f"https://api-inference.huggingface.co/models/{model_id}",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers=headers,
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                data = resp.read()
-                if content_type.startswith("image/"):
-                    return data
-                # Some models return JSON error
-                try:
-                    body = json.loads(data.decode("utf-8", errors="replace"))
-                    if isinstance(body, dict) and body.get("error"):
-                        last_err = f"Model {model_id} error: {body.get('error')[:400]}"
-                        continue
-                except Exception:
-                    last_err = f"Model {model_id} returned unexpected content-type: {content_type}"
-                    continue
-
-        except urllib.error.HTTPError as he:
-            try:
-                err_body = he.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = ""
-            last_err = f"HTTP {he.code} from model {model_id}: {err_body[:400]}"
-            continue
-        except Exception as e:
-            last_err = f"Request error for model {model_id}: {e}"
-            continue
-
-    # If we reach here no model produced an image
-    raise RuntimeError(
-        "All Hugging Face model attempts failed. " + (last_err or "no further details")
+    response = client.images.generate(
+        model="gpt-image-1",
+        prompt=effective_prompt,
+        size=size,
+        quality=quality,
     )
+
+    item = response.data[0]
+    if getattr(item, "b64_json", None):
+        return base64.b64decode(item.b64_json)
+
+    if getattr(item, "url", None):
+        req = urllib.request.Request(item.url, headers={"Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return resp.read()
+
+    raise RuntimeError("OpenAI image response did not include image bytes.")
 
 
 def _safe_slug(title: str) -> str:
@@ -742,10 +692,10 @@ def generate_and_place_images(state: State) -> dict:
 
         if not out_path.exists():
             try:
-                img_bytes = _hf_generate_image_bytes(
+                img_bytes = _openai_generate_image_bytes(
                     prompt=spec["prompt"],
                     size=spec.get("size", "1024x1024"),
-                    quality=spec.get("quality", "medium"),
+                    quality="low",
                 )
                 out_path.write_bytes(img_bytes)
             except Exception as e:
